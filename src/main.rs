@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
         if let Some(id) = anvil.id() {
             let _ = signal::kill(Pid::from_raw(id as i32), Signal::SIGKILL);
         }
-        anyhow::bail!("Anvil failed to boot within 10 seconds. Port 8546 may be bound.");
+        anyhow::bail!("Anvil failed to boot within 30 seconds. Port 8546 may be bound.");
     }
     pb.set_message("Anvil ready.");
 

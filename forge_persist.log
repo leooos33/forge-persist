@@ -1,0 +1,6 @@
+Error: error sending request for url (http://localhost:4001/)
+
+Context:
+- Error #0: client error (Connect)
+- Error #1: tcp connect error
+- Error #2: Connection refused (os error 111)

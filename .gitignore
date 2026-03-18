@@ -1,0 +1,4 @@
+target/
+.forge-persist/
+*.log
+benchmark*.csv

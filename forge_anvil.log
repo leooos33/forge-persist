@@ -1,0 +1,4 @@
+Compiling 16 files with Solc 0.8.26
+Solc 0.8.26 finished in 725.14ms
+Compiler run successful!
+Error: Multiple contracts in the target path. Please specify the contract name with `--tc ContractName`

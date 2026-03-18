@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::io::Read;
+use flate2::read::GzDecoder;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -47,8 +49,6 @@ pub struct GenesisAccount {
     pub storage: Option<BTreeMap<String, String>>,
 }
 
-// AnvilState format parsing
-// Accounts might be nested under `{"accounts": { "0x...": {...} }}` or flat
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
 pub enum AnvilStateDump {
@@ -65,7 +65,6 @@ impl AnvilStateDump {
     }
 }
 
-// Anvil outputs can output numbers instead of hex strings for nonces/balances depending on version.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnvilAccount {
     #[serde(default)]
@@ -105,8 +104,16 @@ pub async fn generate_genesis(
         .await
         .context("Failed to read Anvil state dump JSON")?;
 
-    let state: AnvilStateDump = serde_json::from_str(&raw)
-        .context("Failed to deserialize Anvil state payload into strong types")?;
+    let state: AnvilStateDump = if raw.trim().starts_with("\"0x") {
+        let hex_str = raw.trim().trim_matches('"').trim_start_matches("0x");
+        let compressed = hex::decode(hex_str).context("Invalid hex string from Anvil dump")?;
+        let mut d = GzDecoder::new(&compressed[..]);
+        let mut decompressed = String::new();
+        d.read_to_string(&mut decompressed).context("Failed GZIP decompression")?;
+        serde_json::from_str(&decompressed).context("Failed to deserialize decompressed JSON")?
+    } else {
+        serde_json::from_str(&raw).context("Failed to deserialize generic JSON")?
+    };
 
     let accounts_map = state.into_accounts();
     let mut alloc = BTreeMap::new();
@@ -115,21 +122,18 @@ pub async fn generate_genesis(
         let balance_hex = to_hex_string(&acc.balance);
         let nonce_hex = to_hex_string(&acc.nonce);
 
-        // Reth expects exactly "0x0" if empty, but Option serialization avoids writing it if omitted.
-        // Also strip "0x" and "0x0" codes
         let code = match acc.code {
             Some(ref c) if c == "0x" || c == "0x0" => None,
             other => other,
         };
 
-        // Filter out completely empty accounts to keep genesis lightweight
         let has_balance = balance_hex != "0x0";
         let has_nonce = nonce_hex != "0x0";
         let has_code = code.is_some();
         let has_storage = acc.storage.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
 
         if !has_balance && !has_nonce && !has_code && !has_storage {
-            continue;
+            continue; // Filter dropped
         }
 
         let clean_addr = if addr.starts_with("0x") {
@@ -166,12 +170,12 @@ pub async fn generate_genesis(
             shanghai_time: 0,
             cancun_time: 0,
         },
-        nonce: "0x0".to_string(),
+        nonce: "0x0000000000000000".to_string(),
         timestamp: "0x0".to_string(),
-        extra_data: "0x0".to_string(),
+        extra_data: "0x".to_string(),
         gas_limit: "0x1fffffffffffff".to_string(),
         difficulty: "0x0".to_string(),
-        mix_hash: "0x0".to_string(),
+        mix_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         coinbase: "0x0000000000000000000000000000000000000000".to_string(),
         alloc,
     };
@@ -189,36 +193,80 @@ pub async fn generate_genesis(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
-    fn test_poka_yoke_account_conversion() {
+    fn test_missing_and_malformed_fields_dropped() -> Result<()> {
         let raw_json = r#"{
-            "0xdeadbeef11112222333344445555666677778888": {
-                "balance": 1000000,
-                "nonce": "0x1",
-                "code": "0x6060",
-                "storage": {
-                    "0x0000000000000000000000000000000000000000000000000000000000000000": "0x01"
-                }
-            },
             "0xempty": {
-                "balance": "0x0",
-                "nonce": 0,
-                "code": "0x",
-                "storage": {}
+                "balance": 0,
+                "nonce": 0
+            },
+            "0xvalid": {
+                "balance": 100,
+                "nonce": 1,
+                "code": "0x6060"
             }
         }"#;
-
-        let state: AnvilStateDump = serde_json::from_str(raw_json).unwrap();
+        let state: AnvilStateDump = serde_json::from_str(raw_json)?;
         let flat = state.into_accounts();
         
-        // Assert deadbeef parsed correctly
-        let acc = flat.get("0xdeadbeef11112222333344445555666677778888").unwrap();
-        assert_eq!(to_hex_string(&acc.balance), "0xf4240"); // 1000000 in hex
-        assert_eq!(to_hex_string(&acc.nonce), "0x1");
-        
-        // Assert empty handled
-        let empty = flat.get("0xempty").unwrap();
-        assert_eq!(to_hex_string(&empty.balance), "0x0");
+        let empty_acc = flat.get("0xempty").unwrap();
+        let valid_acc = flat.get("0xvalid").unwrap();
+
+        assert_eq!(to_hex_string(&empty_acc.balance), "0x0");
+        assert_eq!(to_hex_string(&valid_acc.balance), "0x64");
+        Ok(())
+    }
+
+    #[test]
+    fn test_hex_standardization() -> Result<()> {
+        let n: serde_json::Value = serde_json::from_str("1000000")?;
+        assert_eq!(to_hex_string(&n), "0xf4240");
+
+        let s: serde_json::Value = serde_json::from_str("\"1000000\"")?;
+        assert_eq!(to_hex_string(&s), "0xf4240");
+
+        let h: serde_json::Value = serde_json::from_str("\"0xf4240\"")?;
+        assert_eq!(to_hex_string(&h), "0xf4240");
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_vs_flat_deserialization() -> Result<()> {
+        let nested = r#"{"accounts": {"0x1": {"balance": 1}}}"#;
+        let flat = r#"{"0x1": {"balance": 1}}"#;
+
+        let state_nested: AnvilStateDump = serde_json::from_str(nested)?;
+        let state_flat: AnvilStateDump = serde_json::from_str(flat)?;
+
+        assert_eq!(
+            to_hex_string(&state_nested.into_accounts().get("0x1").unwrap().balance),
+            to_hex_string(&state_flat.into_accounts().get("0x1").unwrap().balance)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_genesis_integration() -> Result<()> {
+        let dir = tempdir()?;
+        let dump_path = dir.path().join("state_dump.json");
+        let genesis_path = dir.path().join("genesis.json");
+
+        let mock_dump = r#"{"0x00000000000000000000000000000000000000aa": {"balance": "0x100"}}"#;
+        tokio::fs::write(&dump_path, mock_dump).await?;
+
+        let chain_id = 31337;
+        generate_genesis(chain_id, &dump_path, &genesis_path).await?;
+
+        assert!(genesis_path.exists());
+
+        let out_obj = tokio::fs::read_to_string(&genesis_path).await?;
+        let gen: RethGenesis = serde_json::from_str(&out_obj)?;
+
+        assert_eq!(gen.config.chain_id, 31337);
+        assert_eq!(gen.gas_limit, "0x1fffffffffffff");
+        assert!(gen.alloc.contains_key("00000000000000000000000000000000000000aa"));
+        Ok(())
     }
 }
